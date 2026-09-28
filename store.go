@@ -12,7 +12,7 @@ import (
 // store 以 JSONL（每行一个 JSON 对象）持久化三类数据：
 //   - graph.jsonl：版本节点与图关系（pkgVersion，发布顺序）；
 //   - requests.jsonl：外部请求号幂等记录；
-//   - audit.jsonl：隔离/解除安全事件（审计历史）。
+//   - audit.jsonl：隔离/按原因解除/豁免授予/豁免撤销安全事件（审计历史）。
 //
 // 写入采用 append 落盘，行级原子长度使重启重建简单直接：
 // 服务启动时顺序回放三个日志即可还原全部内存状态。
@@ -184,10 +184,33 @@ func (s *Service) load() error {
 		if ev.Rev > s.securityRev {
 			s.securityRev = ev.Rev
 		}
-		if ev.Kind == OpQuarantine {
-			s.active[ev.Target.key()] = ev
-		} else { // release 与其后的 quarantine 配对删除
-			delete(s.active, ev.Target.key())
+		k := ev.Target.key()
+		switch ev.Kind {
+		case OpQuarantine:
+			if s.active[k] == nil {
+				s.active[k] = map[string]*SecurityEvent{}
+			}
+			s.active[k][ev.Reason] = ev
+		case OpRelease, OpReleaseRisk:
+			// release_risk 自带 RiskReason；旧式单风险 release 只能在恰有一条
+			// 生效隔离时出现，回放时按现存的唯一原因定位。
+			reason := ev.RiskReason
+			if ev.Kind == OpRelease {
+				if risks := s.active[k]; len(risks) == 1 {
+					for r := range risks {
+						reason = r
+					}
+				}
+			}
+			delete(s.active[k], reason)
+			if len(s.active[k]) == 0 {
+				delete(s.active, k)
+			}
+			delete(s.waivers, waiverKey(ev.Target, reason))
+		case OpWaiverGrant:
+			s.waivers[waiverKey(ev.Target, ev.RiskReason)] = waiverFromEvent(ev)
+		case OpWaiverRevoke:
+			delete(s.waivers, waiverKey(ev.Target, ev.RiskReason))
 		}
 	}
 	return nil
