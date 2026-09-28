@@ -218,7 +218,7 @@ func TestIdempotencyReplayAndConflict(t *testing.T) {
 	assertKind(t, err, KindIdempotent)
 
 	// 同一请求号不能跨操作复用。
-	if _, err := s.Quarantine("req-1", v("lib", "1.0.0"), ""); err == nil {
+	if _, err := s.Quarantine("req-1", v("lib", "1.0.0"), "risk"); err == nil {
 		t.Fatal("reusing publish request id for quarantine must conflict")
 	} else {
 		assertKind(t, err, KindIdempotent)
@@ -342,19 +342,19 @@ func TestReleaseDoesNotRestoreVersionsBlockedByOtherPaths(t *testing.T) {
 	mustPublish(t, s, "a", "a", "1", dep("x", "1"), dep("y", "1"))
 
 	// 直接隔离 B：A、X、Y 全部受影响。
-	if _, err := s.Quarantine("q-b", v("b", "1"), ""); err != nil {
+	if _, err := s.Quarantine("q-b", v("b", "1"), "risk-b"); err != nil {
 		t.Fatal(err)
 	}
-	// 另外隔离 X。
-	if _, err := s.Quarantine("q-x", v("x", "1"), ""); err != nil {
+	// 另外因不同原因隔离 X。
+	if _, err := s.Quarantine("q-x", v("x", "1"), "risk-x"); err != nil {
 		t.Fatal(err)
 	}
 	if s.SecurityRev() != 2 {
 		t.Fatalf("rev = %d, want 2", s.SecurityRev())
 	}
 
-	// 解除 B 上的隔离；但 A 仍经 X 被阻塞，X 自身也仍被隔离。
-	if _, err := s.Release("r-b", v("b", "1"), "patched upstream"); err != nil {
+	// 解除 B 上 risk-b 这一条隔离；但 A 仍经 X 被阻塞，X 自身也仍被隔离。
+	if _, err := s.Release("r-b", v("b", "1"), "risk-b"); err != nil {
 		t.Fatal(err)
 	}
 	if s.SecurityRev() != 3 {
@@ -376,7 +376,7 @@ func TestReleaseDoesNotRestoreVersionsBlockedByOtherPaths(t *testing.T) {
 	}
 
 	// 再解除 X，全部恢复。
-	if _, err := s.Release("r-x", v("x", "1"), ""); err != nil {
+	if _, err := s.Release("r-x", v("x", "1"), "risk-x"); err != nil {
 		t.Fatal(err)
 	}
 	if r, err := s.Resolve("a", "1"); err != nil || len(r.Versions) != 4 {
@@ -389,7 +389,7 @@ func TestQuarantineValidationAndStateConflicts(t *testing.T) {
 	mustPublish(t, s, "p", "lib", "1")
 
 	// 目标不存在。
-	if _, err := s.Quarantine("q1", v("ghost", "1"), ""); err == nil {
+	if _, err := s.Quarantine("q1", v("ghost", "1"), "risk"); err == nil {
 		t.Fatal("quarantine of missing version must fail")
 	} else {
 		assertKind(t, err, KindNotFound)
@@ -397,22 +397,31 @@ func TestQuarantineValidationAndStateConflicts(t *testing.T) {
 
 	// 摘要不匹配。
 	wrong := Version{Name: "lib", Version: "1", Digest: digest("nope")}
-	_, err := s.Quarantine("q2", wrong, "")
+	_, err := s.Quarantine("q2", wrong, "risk")
 	assertKind(t, err, KindDigest)
 
 	// 参数缺失。
-	_, err = s.Quarantine("", v("lib", "1"), "")
+	_, err = s.Quarantine("", v("lib", "1"), "risk")
+	assertKind(t, err, KindInvalidParam)
+	_, err = s.Quarantine("q-no-reason", v("lib", "1"), "  ")
 	assertKind(t, err, KindInvalidParam)
 
-	// 重复隔离冲突。
-	if _, err := s.Quarantine("q3", v("lib", "1"), ""); err != nil {
+	// 同原因重复隔离冲突。
+	if _, err := s.Quarantine("q3", v("lib", "1"), "dup-risk"); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.Quarantine("q4", v("lib", "1"), "")
+	_, err = s.Quarantine("q4", v("lib", "1"), "dup-risk")
 	assertKind(t, err, KindConflict)
 
-	// 解除未被隔离的版本。
-	_, err = s.Release("r1", v("ghost", "1"), "")
+	// 不同原因的再次隔离允许（风险叠加）。
+	if _, err := s.Quarantine("q5", v("lib", "1"), "other-risk"); err != nil {
+		t.Fatalf("quarantine for a different reason must succeed: %v", err)
+	}
+
+	// 解除不存在的原因 -> 冲突；解除未发布版本 -> not_found。
+	_, err = s.Release("r0", v("lib", "1"), "never-existed")
+	assertKind(t, err, KindConflict)
+	_, err = s.Release("r1", v("ghost", "1"), "risk")
 	assertKind(t, err, KindNotFound)
 }
 
@@ -439,19 +448,19 @@ func TestSecurityIdempotencyReplayDoesNotBumpRev(t *testing.T) {
 	_, err = s.Quarantine("q-1", v("lib", "1"), "reason B")
 	assertKind(t, err, KindIdempotent)
 
-	rel, err := s.Release("r-1", v("lib", "1"), "")
+	rel, err := s.Release("r-1", v("lib", "1"), "reason A")
 	if err != nil {
 		t.Fatal(err)
 	}
-	rel2, err := s.Release("r-1", v("lib", "1"), "")
+	rel2, err := s.Release("r-1", v("lib", "1"), "reason A")
 	if err != nil || !rel2.Replayed || rel2.Event.Seq != rel.Event.Seq {
 		t.Fatalf("release replay mismatch: %+v err=%v", rel2, err)
 	}
 	if s.SecurityRev() != 2 {
 		t.Fatalf("rev = %d, want 2", s.SecurityRev())
 	}
-	// 解除重放后再次解除 -> 冲突（当前无生效隔离）。
-	_, err = s.Release("r-other", v("lib", "1"), "")
+	// 解除重放后再次解除同一原因 -> 冲突（该原因已无生效隔离）。
+	_, err = s.Release("r-other", v("lib", "1"), "reason A")
 	assertKind(t, err, KindConflict)
 }
 
@@ -490,7 +499,7 @@ func TestImpactQuery(t *testing.T) {
 		}
 	}
 
-	if _, err := s.Quarantine("q", v("util", "1"), ""); err != nil {
+	if _, err := s.Quarantine("q", v("util", "1"), "risk"); err != nil {
 		t.Fatal(err)
 	}
 	rep, err = s.Impact("util", "1")
@@ -520,7 +529,7 @@ func TestAuditHistory(t *testing.T) {
 	s, _ := NewService("")
 	mustPublish(t, s, "p", "lib", "1")
 	q, _ := s.Quarantine("q", v("lib", "1"), "incident-1")
-	r, _ := s.Release("r", v("lib", "1"), "cleared")
+	r, _ := s.Release("r", v("lib", "1"), "incident-1")
 
 	events := s.Snapshot().AuditEvents()
 	if len(events) != 2 {
@@ -551,9 +560,9 @@ func TestSnapshotPinsOneSecurityRevision(t *testing.T) {
 	go func() {
 		defer close(done)
 		// 持快照期间进行多次安全操作。
-		_, _ = s.Quarantine("q1", v("util", "1.0.0"), "")
-		_, _ = s.Release("r1", v("util", "1.0.0"), "")
-		_, _ = s.Quarantine("q2", v("util", "1.0.0"), "")
+		_, _ = s.Quarantine("q1", v("util", "1.0.0"), "risk-1")
+		_, _ = s.Release("r1", v("util", "1.0.0"), "risk-1")
+		_, _ = s.Quarantine("q2", v("util", "1.0.0"), "risk-2")
 	}()
 	<-done
 

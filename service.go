@@ -3,11 +3,16 @@
 // 核心模型：
 //   - 软件包版本由 (名称, 版本号, 内容摘要) 唯一确定，发布后不可变；
 //   - 发布时保存解析后的直接依赖，依赖不存在或构成环都会导致发布失败；
-//   - 安全事件隔离某一具体版本，隔离效果沿依赖图正向传播：任何（传递）依赖到
-//     被隔离版本的版本都会在安装解析中被排除；
-//   - 每次隔离/解除都使安全修订号 +1，解析在进入时获取一份不可变快照，
+//   - 安全事件隔离某一具体版本（隔离原因是该隔离身份的一部分，同一版本可因
+//     不同原因被多条隔离同时命中），隔离效果沿依赖图正向传播：任何（传递）依赖
+//     到被隔离版本的版本都会在安装解析中被排除；
+//   - 每次隔离/解除/豁免/撤销都使安全修订号 +1，解析在进入时获取一份不可变快照，
 //     全程只读取该快照；
-//   - 发布、隔离、解除均要求携带外部请求号实现幂等，同号异内容返回冲突。
+//   - 有期限的风险豁免精确关联“具体版本 + 隔离原因（隔离事件序号）”，只放开这
+//     一条风险；豁免到期、被撤销，或同一版本出现其它原因的新隔离时，豁免都不能
+//     让该版本继续通过解析；
+//   - 发布、隔离、解除、豁免申请/撤销均要求携带外部请求号实现幂等，同号异内容
+//     返回冲突。
 package packagequarantine
 
 import (
@@ -32,27 +37,29 @@ type pkgVersion struct {
 // requestRecord 记录外部请求号与已应用操作的对应关系，用于幂等重放与冲突检测。
 type requestRecord struct {
 	ReqID     string    `json:"req_id"`
-	Op        string    `json:"op"` // publish | quarantine | release
+	Op        string    `json:"op"` // publish | quarantine | release | grant_waiver | revoke_waiver
 	Hash      string    `json:"hash"`
-	Ref       string    `json:"ref"` // publish: 版本键；隔离/解除: 事件序号
+	Ref       string    `json:"ref"` // publish: 版本键；其它操作: 事件序号
 	CreatedAt time.Time `json:"created_at"`
 }
 
 // 安全事件类型。
 const (
-	OpQuarantine = "quarantine"
-	OpRelease    = "release"
+	OpQuarantine   = "quarantine"
+	OpRelease      = "release"
+	OpGrantWaiver  = "grant_waiver"
+	OpRevokeWaiver = "revoke_waiver"
 )
 
-// SecurityEvent 是一条审计历史：隔离或解除事件。
+// SecurityEvent 是一条审计历史：隔离、解除或豁免相关事件。
 type SecurityEvent struct {
 	Seq        int       `json:"seq"`         // 全局单调递增的事件序号
 	Rev        int       `json:"rev"`         // 应用该事件后的安全修订号
-	Kind       string    `json:"kind"`        // quarantine | release
+	Kind       string    `json:"kind"`        // quarantine | release | grant_waiver | revoke_waiver
 	Target     Version   `json:"target"`      // 被操作的具体版本
 	ReqID      string    `json:"req_id"`      // 外部请求号
-	Reason     string    `json:"reason"`      // 备注（可选）
-	RelatedSeq int       `json:"related_seq"` // release 事件所解除的 quarantine 事件序号
+	Reason     string    `json:"reason"`      // quarantine/grant: 隔离原因；release: 被解除隔离的原因；revoke: 撤销备注
+	RelatedSeq int       `json:"related_seq"` // release/grant 关联的 quarantine 序号；revoke 关联的 grant 事件序号
 	Time       time.Time `json:"time"`
 }
 
@@ -64,21 +71,45 @@ type Service struct {
 
 	versions map[string]*pkgVersion // key(name@version) -> 版本
 	requests map[string]*requestRecord
-	events   []*SecurityEvent          // 按 Seq 排序的完整审计历史
-	active   map[string]*SecurityEvent // 当前生效的隔离：版本键 -> quarantine 事件
+	events   []*SecurityEvent // 按 Seq 排序的完整审计历史
+
+	// 当前生效的隔离：版本键 -> 隔离原因 -> quarantine 事件。
+	// 同一版本可因不同原因同时存在多条隔离，解除/豁免都只针对其中一条。
+	active map[string]map[string]*SecurityEvent
+
+	// 全部豁免授予记录：grant 事件序号 -> 豁免（撤销时原地更新并追加落盘）。
+	waivers map[int]*RiskWaiver
+
+	// 每次成功解析采用豁免的留痕（内存中始终保留，持久化模式同时落盘）。
+	waiverUsage []WaiverUsageRecord
 
 	securityRev int // 当前安全修订号
 	nextSeq     int // 下一个事件序号
+
+	// nowFn 返回当前时间；nil 时使用 time.Now().UTC()。测试可替换以获得确定的
+	// 到期/撤销语义。注意：快照另有自己的采样时刻，nowFn 只影响写入侧（授予、
+	// 撤销、发布与事件时间）。
+	nowFn func() time.Time
+}
+
+// now 返回写入操作使用的当前时间（UTC）。
+func (s *Service) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // NewService 创建服务。dir 为空时使用纯内存模式；否则在 dir 下以 JSONL 持久化
-// 图关系（graph.jsonl）、幂等请求（requests.jsonl）与审计历史（audit.jsonl），
+// 图关系（graph.jsonl）、幂等请求（requests.jsonl）、审计历史（audit.jsonl）、
+// 豁免（waivers.jsonl）与豁免采用留痕（waiver_usage.jsonl），
 // 目录已存在数据时会自动重建状态。
 func NewService(dir string) (*Service, error) {
 	s := &Service{
 		versions: map[string]*pkgVersion{},
 		requests: map[string]*requestRecord{},
-		active:   map[string]*SecurityEvent{},
+		active:   map[string]map[string]*SecurityEvent{},
+		waivers:  map[int]*RiskWaiver{},
 	}
 	if dir != "" {
 		st, err := openStore(dir)
@@ -185,7 +216,7 @@ func (s *Service) Publish(req PublishRequest) (*PublishResult, error) {
 	pv := &pkgVersion{
 		Version:      v,
 		Deps:         resolved,
-		PublishedAt:  time.Now().UTC(),
+		PublishedAt:  s.now(),
 		PublishReqID: req.RequestID,
 	}
 	rec := &requestRecord{
@@ -203,18 +234,23 @@ func (s *Service) Publish(req PublishRequest) (*PublishResult, error) {
 	return &PublishResult{Version: v, Deps: cloneDeps(resolved)}, nil
 }
 
-// SecurityResult 是隔离/解除操作的结果。
+// SecurityResult 是隔离/解除/撤销操作的结果。
 type SecurityResult struct {
 	Event    *SecurityEvent
 	Replayed bool // 是否为同一外部请求号的重放
 }
 
-// Quarantine 隔离某一具体版本。版本必须已发布。
-// 若该版本当前已有生效隔离（来自不同请求号），返回 KindConflict。
+// Quarantine 因给定原因隔离某一具体版本。版本必须已发布。
+//
+// 原因是隔离身份的一部分：同一版本可因不同原因被多次隔离，各自独立生效、
+// 独立解除/豁免。若该版本当前已有相同原因的生效隔离，返回 KindConflict。
 // 成功后安全修订号加一。
 func (s *Service) Quarantine(requestID string, target Version, reason string) (*SecurityResult, error) {
 	if err := validateSecurityOp(requestID, target); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(reason) == "" {
+		return nil, errf(KindInvalidParam, "quarantine reason is required")
 	}
 	hash := payloadHash(OpQuarantine, struct {
 		Target Version `json:"target"`
@@ -234,9 +270,10 @@ func (s *Service) Quarantine(requestID string, target Version, reason string) (*
 	if err != nil {
 		return nil, err
 	}
-	if ev, ok := s.active[pv.Version.key()]; ok {
+	if ev, ok := s.active[pv.Version.key()][reason]; ok {
 		return nil, errf(KindConflict,
-			"version %s is already quarantined by event seq=%d", pv.Version.key(), ev.Seq)
+			"version %s is already quarantined for reason %q by event seq=%d",
+			pv.Version.key(), reason, ev.Seq)
 	}
 
 	ev := s.newEvent(OpQuarantine, pv.Version, requestID, reason, 0)
@@ -245,22 +282,28 @@ func (s *Service) Quarantine(requestID string, target Version, reason string) (*
 		return nil, err
 	}
 	s.appendEvent(ev, rec)
-	s.active[pv.Version.key()] = ev
+	if s.active[pv.Version.key()] == nil {
+		s.active[pv.Version.key()] = map[string]*SecurityEvent{}
+	}
+	s.active[pv.Version.key()][reason] = ev
 	return &SecurityResult{Event: ev}, nil
 }
 
-// Release 解除目标版本上当前生效的隔离。成功后安全修订号加一。
+// Release 解除目标版本上“指定原因”的那一条隔离。成功后安全修订号加一。
 //
-// 解除只移除指向该版本的那一条隔离；如果它（或其它版本）仍被其它生效隔离
-// 沿依赖路径影响，解析结果不会因此恢复。
-func (s *Service) Release(requestID string, target Version, reason string) (*SecurityResult, error) {
+// 解除只移除 (版本, 原因) 这一条隔离；同一版本的其它原因隔离、以及其它版本的
+// 隔离仍然生效，经它们传播的阻塞不会因此恢复。
+func (s *Service) Release(requestID string, target Version, quarantineReason string) (*SecurityResult, error) {
 	if err := validateSecurityOp(requestID, target); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(quarantineReason) == "" {
+		return nil, errf(KindInvalidParam, "quarantine reason is required")
 	}
 	hash := payloadHash(OpRelease, struct {
 		Target Version `json:"target"`
 		Reason string  `json:"reason"`
-	}{target, reason})
+	}{target, quarantineReason})
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -275,19 +318,228 @@ func (s *Service) Release(requestID string, target Version, reason string) (*Sec
 	if err != nil {
 		return nil, err
 	}
-	qEvent, ok := s.active[pv.Version.key()]
+	qEvent, ok := s.active[pv.Version.key()][quarantineReason]
 	if !ok {
-		return nil, errf(KindConflict, "version %s has no active quarantine", pv.Version.key())
+		return nil, errf(KindConflict,
+			"version %s has no active quarantine for reason %q",
+			pv.Version.key(), quarantineReason)
 	}
 
-	ev := s.newEvent(OpRelease, pv.Version, requestID, reason, qEvent.Seq)
+	ev := s.newEvent(OpRelease, pv.Version, requestID, quarantineReason, qEvent.Seq)
 	rec := s.newRequestRecord(requestID, OpRelease, hash, ev)
 	if err := s.persistSecurity(ev, rec); err != nil {
 		return nil, err
 	}
 	s.appendEvent(ev, rec)
-	delete(s.active, pv.Version.key())
+	delete(s.active[pv.Version.key()], quarantineReason)
+	if len(s.active[pv.Version.key()]) == 0 {
+		delete(s.active, pv.Version.key())
+	}
 	return &SecurityResult{Event: ev}, nil
+}
+
+// Approval 记录豁免的批准信息。
+type Approval struct {
+	Approver string    `json:"approver"` // 批准人，必填
+	Ticket   string    `json:"ticket"`   // 批准单号/工单号，可选
+	Note     string    `json:"note"`     // 批准备注，可选
+	Time     time.Time `json:"time"`     // 批准时间；申请时留空则由服务填入授予时间
+}
+
+// RiskWaiver 是一条有期限的风险豁免：精确关联某条隔离（具体版本 + 隔离原因 +
+// 隔离事件序号），只放开这一条风险，不覆盖同一版本后来出现的任何其它隔离原因。
+type RiskWaiver struct {
+	// Seq 是授予豁免的审计事件序号，也是豁免的稳定标识。
+	Seq int `json:"seq"`
+	// QuarantineSeq 是被豁免的那条 quarantine 事件序号（精确关联，不只是原因字符串）。
+	QuarantineSeq int       `json:"quarantine_seq"`
+	Target        Version   `json:"target"`
+	Reason        string    `json:"reason"` // 被豁免的隔离原因
+	GrantedAt     time.Time `json:"granted_at"`
+	ExpiresAt     time.Time `json:"expires_at"` // 有效期截止；该时刻起豁免失效
+	Approval      Approval  `json:"approval"`
+
+	// 撤销信息；RevokedAt 为零值表示未撤销。
+	RevokedAt      time.Time `json:"revoked_at,omitempty"`
+	RevokedReqID   string    `json:"revoked_req_id,omitempty"`
+	RevokeReason   string    `json:"revoke_reason,omitempty"`
+	RevokeEventSeq int       `json:"revoke_event_seq,omitempty"`
+}
+
+// ActiveAt 报告豁免在时刻 now 是否有效：未撤销且未到期
+// （到期时刻本身即失效，故采用严格的 Before 判定）。
+func (w *RiskWaiver) ActiveAt(now time.Time) bool {
+	return w.RevokedAt.IsZero() && now.Before(w.ExpiresAt)
+}
+
+// WaiverGrantResult 是豁免申请结果。
+type WaiverGrantResult struct {
+	Waiver   *RiskWaiver
+	Event    *SecurityEvent
+	Replayed bool
+}
+
+// GrantWaiver 申请一条有期限的风险豁免。
+//
+// 豁免精确关联 (target, quarantineReason) 当前生效的那一条隔离（内部以隔离事件
+// 序号锁定）。要求：
+//   - 该版本当前确实存在该原因的生效隔离，否则 KindConflict；
+//   - expiresAt 必须晚于当前时间；Approval.Approver 必填，否则 KindInvalidParam；
+//   - 该条隔离尚不存在“未撤销且未到期”的豁免，否则 KindConflict。
+//
+// 同号 + 同内容重放首次结果且不推进修订号；同号异内容返回 KindIdempotent。
+// 成功授予后安全修订号加一。
+func (s *Service) GrantWaiver(requestID string, target Version, quarantineReason string,
+	expiresAt time.Time, approval Approval) (*WaiverGrantResult, error) {
+
+	if err := validateSecurityOp(requestID, target); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(quarantineReason) == "" {
+		return nil, errf(KindInvalidParam, "quarantine reason is required")
+	}
+	now := s.now()
+	if expiresAt.IsZero() || !expiresAt.After(now) {
+		return nil, errf(KindInvalidParam, "waiver expiry must be a future time")
+	}
+	if strings.TrimSpace(approval.Approver) == "" {
+		return nil, errf(KindInvalidParam, "waiver approver is required")
+	}
+	if approval.Time.IsZero() {
+		approval.Time = now
+	}
+	// 幂等哈希只覆盖调用方提供的字段；Approval.Time 缺省由服务端填入当前时间，
+	// 属于服务端元数据，不参与“同内容”判定（否则每次重放都会因时间不同而冲突）。
+	hash := payloadHash(OpGrantWaiver, struct {
+		Target   Version `json:"target"`
+		Reason   string  `json:"reason"`
+		Expires  int64   `json:"expires_unix_nano"`
+		Approver string  `json:"approver"`
+		Ticket   string  `json:"ticket"`
+		Note     string  `json:"note"`
+	}{target, quarantineReason, expiresAt.UTC().UnixNano(),
+		approval.Approver, approval.Ticket, approval.Note})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if rec, conflict := s.lookupRequest(requestID, OpGrantWaiver, hash); conflict != nil {
+		return nil, conflict
+	} else if rec != nil {
+		seq := mustAtoi(rec.Ref)
+		return &WaiverGrantResult{Waiver: s.waivers[seq], Event: s.eventBySeq(seq), Replayed: true}, nil
+	}
+
+	pv, err := s.lookupVersion(target)
+	if err != nil {
+		return nil, err
+	}
+	qEvent, ok := s.active[pv.Version.key()][quarantineReason]
+	if !ok {
+		return nil, errf(KindConflict,
+			"version %s has no active quarantine for reason %q; waiver can only cover an existing risk",
+			pv.Version.key(), quarantineReason)
+	}
+	if cur := s.currentWaiver(qEvent.Seq, now); cur != nil {
+		return nil, errf(KindConflict,
+			"quarantine seq=%d already has an active waiver (waiver seq=%d, expires %s)",
+			qEvent.Seq, cur.Seq, cur.ExpiresAt.Format(time.RFC3339))
+	}
+
+	seq := s.allocSeq()
+	w := &RiskWaiver{
+		Seq:           seq,
+		QuarantineSeq: qEvent.Seq,
+		Target:        pv.Version,
+		Reason:        quarantineReason,
+		GrantedAt:     now,
+		ExpiresAt:     expiresAt.UTC(),
+		Approval:      approval,
+	}
+	ev := s.eventAt(seq, OpGrantWaiver, pv.Version, requestID, quarantineReason, qEvent.Seq, now)
+	rec := &requestRecord{ReqID: requestID, Op: OpGrantWaiver, Hash: hash, Ref: itoa(seq), CreatedAt: now}
+	if err := s.persistWaiverGrant(ev, rec, w); err != nil {
+		return nil, err
+	}
+	s.events = append(s.events, ev)
+	s.requests[requestID] = rec
+	s.waivers[seq] = w
+	s.securityRev = ev.Rev
+	return &WaiverGrantResult{Waiver: w, Event: ev}, nil
+}
+
+// RevokeWaiver 撤销针对 (target, quarantineReason) 当前有效（未撤销且未到期）的
+// 豁免。成功后安全修订号加一。同号重放不重复生效。
+func (s *Service) RevokeWaiver(requestID string, target Version, quarantineReason, note string) (*SecurityResult, error) {
+	if err := validateSecurityOp(requestID, target); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(quarantineReason) == "" {
+		return nil, errf(KindInvalidParam, "quarantine reason is required")
+	}
+	hash := payloadHash(OpRevokeWaiver, struct {
+		Target Version `json:"target"`
+		Reason string  `json:"reason"`
+		Note   string  `json:"note"`
+	}{target, quarantineReason, note})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if rec, conflict := s.lookupRequest(requestID, OpRevokeWaiver, hash); conflict != nil {
+		return nil, conflict
+	} else if rec != nil {
+		return &SecurityResult{Event: s.eventBySeq(mustAtoi(rec.Ref)), Replayed: true}, nil
+	}
+
+	pv, err := s.lookupVersion(target)
+	if err != nil {
+		return nil, err
+	}
+	qEvent, ok := s.active[pv.Version.key()][quarantineReason]
+	if !ok {
+		return nil, errf(KindConflict,
+			"version %s has no active quarantine for reason %q", pv.Version.key(), quarantineReason)
+	}
+	now := s.now()
+	w := s.currentWaiver(qEvent.Seq, now)
+	if w == nil {
+		return nil, errf(KindConflict,
+			"no active waiver for quarantine seq=%d (%s %q)",
+			qEvent.Seq, pv.Version.key(), quarantineReason)
+	}
+
+	seq := s.allocSeq()
+	ev := s.eventAt(seq, OpRevokeWaiver, pv.Version, requestID, note, w.Seq, now)
+	rec := &requestRecord{ReqID: requestID, Op: OpRevokeWaiver, Hash: hash, Ref: itoa(seq), CreatedAt: now}
+
+	w.RevokedAt = now
+	w.RevokedReqID = requestID
+	w.RevokeReason = note
+	w.RevokeEventSeq = seq
+
+	if err := s.persistWaiverRevoke(ev, rec, w); err != nil {
+		return nil, err
+	}
+	s.events = append(s.events, ev)
+	s.requests[requestID] = rec
+	s.securityRev = ev.Rev
+	return &SecurityResult{Event: ev}, nil
+}
+
+// currentWaiver 返回某条隔离当前有效的豁免（未撤销且在 now 时刻未到期），
+// 没有则返回 nil。
+func (s *Service) currentWaiver(quarantineSeq int, now time.Time) *RiskWaiver {
+	var cur *RiskWaiver
+	for _, w := range s.waivers {
+		if w.QuarantineSeq != quarantineSeq || !w.RevokedAt.IsZero() {
+			continue
+		}
+		if now.Before(w.ExpiresAt) && (cur == nil || w.Seq > cur.Seq) {
+			cur = w
+		}
+	}
+	return cur
 }
 
 // SecurityRev 返回当前安全修订号。
@@ -297,66 +549,143 @@ func (s *Service) SecurityRev() int {
 	return s.securityRev
 }
 
-// Snapshot 获取当前状态的不可变快照（含安全修订号、图与生效隔离）。
-// 一次解析/影响查询的全程只读取返回的这一份快照，期间任何发布或安全操作
-// 都不会影响它。
+// Snapshot 获取当前状态的不可变快照（含安全修订号、采样时刻、图、生效隔离与
+// 该时刻有效的豁免）。一次解析/影响查询的全程只读取返回的这一份快照；采样在
+// 持锁瞬间完成，期间任何发布、隔离、豁免或到期判定都不会影响它。
 func (s *Service) Snapshot() *Snapshot {
+	return s.snapshotAt(time.Now().UTC())
+}
+
+// snapshotAt 与 Snapshot 相同，但显式指定“当前时刻”，用于到期语义的确定性测试。
+func (s *Service) snapshotAt(asOf time.Time) *Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	snap := &Snapshot{
+		svc:      s,
 		rev:      s.securityRev,
+		asOf:     asOf,
 		versions: make(map[string]*pkgVersion, len(s.versions)),
-		active:   make(map[string]*SecurityEvent, len(s.active)),
+		active:   make(map[string]map[string]*SecurityEvent, len(s.active)),
 		events:   make([]*SecurityEvent, len(s.events)),
+		waived:   map[string]map[string]*RiskWaiver{},
 	}
 	for k, pv := range s.versions {
 		snap.versions[k] = pv // pkgVersion 创建后不可变，可直接共享
 	}
-	for k, ev := range s.active {
-		cp := *ev
-		snap.active[k] = &cp
+	for k, m := range s.active {
+		cp := make(map[string]*SecurityEvent, len(m))
+		for reason, ev := range m {
+			e := *ev
+			cp[reason] = &e
+		}
+		snap.active[k] = cp
 	}
 	for i, ev := range s.events {
 		cp := *ev
 		snap.events[i] = &cp
+	}
+
+	// 在与状态拷贝同一把锁、同一采样时刻下判定豁免有效性，杜绝 TOCTOU：
+	// 撤销/到期/新增隔离与解析并发时，快照只会看到采样瞬间已提交的状态。
+	for _, w0 := range s.waivers {
+		if !w0.RevokedAt.IsZero() || !asOf.Before(w0.ExpiresAt) {
+			continue
+		}
+		// 只收录其目标隔离仍以“同一条隔离事件”生效的豁免：豁免锁定的是隔离
+		// 事件序号，旧隔离解除后即便用相同原因字符串重新隔离，旧豁免也不覆盖。
+		m := snap.active[w0.Target.key()]
+		if m == nil || m[w0.Reason] == nil || m[w0.Reason].Seq != w0.QuarantineSeq {
+			continue
+		}
+		w := *w0
+		if snap.waived[w.Target.key()] == nil {
+			snap.waived[w.Target.key()] = map[string]*RiskWaiver{}
+		}
+		// 同一 (版本,原因) 同一时刻至多一条有效豁免；防御性地保留序号更大者。
+		if old := snap.waived[w.Target.key()][w.Reason]; old == nil || w.Seq > old.Seq {
+			snap.waived[w.Target.key()][w.Reason] = &w
+		}
 	}
 	return snap
 }
 
 // Snapshot 是某一时刻的只读视图。
 type Snapshot struct {
+	svc      *Service
 	rev      int
+	asOf     time.Time
 	versions map[string]*pkgVersion
-	active   map[string]*SecurityEvent
+	active   map[string]map[string]*SecurityEvent
 	events   []*SecurityEvent
+
+	// 采样时刻有效、且目标隔离仍生效的豁免：版本键 -> 隔离原因 -> 豁免。
+	waived map[string]map[string]*RiskWaiver
 }
 
 // Rev 返回该快照的安全修订号。
 func (snap *Snapshot) Rev() int { return snap.rev }
 
+// AsOf 返回该快照采样“当前时刻”的时间点（豁免到期判定基准）。
+func (snap *Snapshot) AsOf() time.Time { return snap.asOf }
+
 // Resolution 是成功解析的结果。
 type Resolution struct {
-	Rev      int       // 解析所基于的安全修订快照
-	Root     Version   // 解析起点
-	Versions []Version // 需要安装的全部版本（根 + 所有传递依赖），按 key 排序去重
+	Rev      int         // 解析所基于的安全修订快照
+	Root     Version     // 解析起点
+	Versions []Version   // 需要安装的全部版本（根 + 所有传递依赖），按 key 排序去重
+	Waivers  []WaiverUse // 本次解析实际采用的豁免（闭包内触及的被豁免风险），按 (target, reason) 排序
+}
+
+// WaiverUse 说明一次解析为何可以采用某条豁免：精确到被豁免的版本、隔离原因、
+// 隔离/豁免事件序号，以及从解析根到该版本的依赖路径与批准/有效期信息。
+type WaiverUse struct {
+	Target        Version   `json:"target"`
+	Reason        string    `json:"reason"`
+	QuarantineSeq int       `json:"quarantine_seq"`
+	WaiverSeq     int       `json:"waiver_seq"`
+	Path          []Version `json:"path"`
+	GrantedAt     time.Time `json:"granted_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Approval      Approval  `json:"approval"`
+}
+
+// WaiverUsageRecord 是一次解析采用豁免的留痕。
+type WaiverUsageRecord struct {
+	Time time.Time   `json:"time"`
+	Rev  int         `json:"rev"`
+	Root Version     `json:"root"`
+	Uses []WaiverUse `json:"uses"`
 }
 
 // BlockedError 表示根版本在当前快照下被隔离规则排除。
-// Path 给出可解释的依赖路径：根版本 → … → 被直接隔离的版本。
+// Path 给出可解释的依赖路径：根版本 → … → 被直接隔离的版本；
+// Reason 是终点上实际造成阻塞的那条隔离原因（未被豁免覆盖的原因）。
 type BlockedError struct {
 	Rev         int
 	Path        []Version
 	Quarantined Version
+	Reason      string
 	Cause       *Error
 }
 
 func (e *BlockedError) Error() string { return e.Cause.Error() }
 func (e *BlockedError) Unwrap() error { return e.Cause }
 
+// taintHit 是污染分析命中：从某版本沿依赖边到某个“存在未被豁免的隔离原因”的
+// 版本的路径（不含起点自身的键），以及终点上造成阻塞的那条原因。
+type taintHit struct {
+	path   []string
+	reason string
+}
+
 // Resolve 在该快照上做安装解析：返回根版本及其全部传递依赖。
-// 若根版本被直接隔离，或其任一传递依赖被隔离，则返回 *BlockedError，
-// 其中带有一条从根到被隔离版本的依赖路径。
+// 若根版本被（未豁免的原因）直接隔离，或其任一传递依赖如此，则返回
+// *BlockedError，其中带有一条从根到被隔离版本的依赖路径与阻塞原因。
+//
+// 解析全程只读取该快照：采样之后发生的隔离、豁免授予/撤销只影响下一次请求；
+// 豁免只放开它精确关联的那一条 (版本, 原因) 风险，同一版本的其它风险原因
+// 仍然阻塞解析。成功解析若采用了豁免，会记录一条 WaiverUsageRecord 留痕。
 func (snap *Snapshot) Resolve(name, version string) (*Resolution, error) {
 	k := name + "@" + version
 	root, ok := snap.versions[k]
@@ -366,54 +695,134 @@ func (snap *Snapshot) Resolve(name, version string) (*Resolution, error) {
 
 	tainted := snap.taintMap()
 	if hit := tainted[k]; hit != nil {
-		path := make([]Version, 0, len(hit)+1)
+		path := make([]Version, 0, len(hit.path)+1)
 		path = append(path, root.Version)
-		for _, dk := range hit {
+		for _, dk := range hit.path {
 			path = append(path, snap.versions[dk].Version)
 		}
 		return nil, &BlockedError{
 			Rev:         snap.rev,
 			Path:        path,
 			Quarantined: path[len(path)-1],
-			Cause:       errf(KindDependency, "resolution blocked by quarantine: %s", formatPath(path)),
+			Reason:      hit.reason,
+			Cause: errf(KindDependency,
+				"resolution blocked by quarantine reason %q: %s", hit.reason, formatPath(path)),
 		}
 	}
 
-	// 根未被污染，其整条依赖闭包都不会触及被隔离版本（上面的污染分析已覆盖）。
+	// 根未被污染：收集闭包，同时记录闭包内每个被豁免版本的采用路径与原因。
 	collected := map[string]Version{k: root.Version}
-	var walk func(pv *pkgVersion)
-	walk = func(pv *pkgVersion) {
+	var uses []WaiverUse
+	seen := map[string]bool{}
+
+	var walk func(pv *pkgVersion, stack []Version)
+	walk = func(pv *pkgVersion, stack []Version) {
+		for reason, w := range snap.waived[pv.Version.key()] {
+			qev := snap.active[pv.Version.key()][reason]
+			uses = append(uses, WaiverUse{
+				Target:        pv.Version,
+				Reason:        reason,
+				QuarantineSeq: qev.Seq,
+				WaiverSeq:     w.Seq,
+				Path:          append([]Version(nil), stack...),
+				GrantedAt:     w.GrantedAt,
+				ExpiresAt:     w.ExpiresAt,
+				Approval:      w.Approval,
+			})
+		}
 		for _, d := range pv.Deps {
-			if _, dup := collected[d.key()]; dup {
+			if seen[d.key()] {
 				continue
 			}
+			seen[d.key()] = true
 			collected[d.key()] = d
-			walk(snap.versions[d.key()])
+			walk(snap.versions[d.key()], append(append([]Version{}, stack...), d))
 		}
 	}
-	walk(root)
+	seen[k] = true
+	walk(root, []Version{root.Version})
 
 	out := make([]Version, 0, len(collected))
 	for _, v := range collected {
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].key() < out[j].key() })
-	return &Resolution{Rev: snap.rev, Root: root.Version, Versions: out}, nil
+	sort.Slice(uses, func(i, j int) bool {
+		if uses[i].Target.key() != uses[j].Target.key() {
+			return uses[i].Target.key() < uses[j].Target.key()
+		}
+		return uses[i].Reason < uses[j].Reason
+	})
+
+	res := &Resolution{Rev: snap.rev, Root: root.Version, Versions: out, Waivers: uses}
+	if len(uses) > 0 && snap.svc != nil {
+		snap.svc.recordWaiverUsage(root.Version, snap.rev, uses)
+	}
+	return res, nil
+}
+
+// recordWaiverUsage 将一次解析采用豁免的原因落为留痕。该方法不推进安全修订号
+// （留痕不是安全状态变更），但与状态变更一样经同一把互斥锁串行化。
+func (s *Service) recordWaiverUsage(root Version, rev int, uses []WaiverUse) {
+	rec := WaiverUsageRecord{
+		Time: time.Now().UTC(),
+		Rev:  rev,
+		Root: root,
+		Uses: append([]WaiverUse(nil), uses...),
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.waiverUsage = append(s.waiverUsage, rec)
+	if s.store != nil {
+		_ = s.store.appendWaiverUsage(&rec) // 留痕落盘失败不改变解析结果
+	}
+}
+
+// WaiverUsage 返回全部解析采用豁免的留痕（按记录顺序的防御性拷贝）。
+func (s *Service) WaiverUsage() []WaiverUsageRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]WaiverUsageRecord, len(s.waiverUsage))
+	for i, r := range s.waiverUsage {
+		out[i] = cloneUsageRecord(r)
+	}
+	return out
+}
+
+func cloneUsageRecord(r WaiverUsageRecord) WaiverUsageRecord {
+	cp := r
+	cp.Uses = make([]WaiverUse, len(r.Uses))
+	for i, u := range r.Uses {
+		u.Path = append([]Version(nil), u.Path...)
+		cp.Uses[i] = u
+	}
+	return cp
+}
+
+// QuarantineStatus 描述目标版本上某一条原因隔离及其豁免状态。
+type QuarantineStatus struct {
+	Reason          string    // 隔离原因
+	EventSeq        int       // 隔离事件序号
+	Waived          bool      // 采样时刻该条风险是否被有效豁免覆盖
+	WaiverSeq       int       // 豁免事件序号；未豁免为 0
+	WaiverExpiresAt time.Time // 豁免到期时间
+	WaiverApprover  string    // 豁免批准人
 }
 
 // ImpactEntry 描述受目标版本影响的一个（传递）依赖方。
 type ImpactEntry struct {
 	Version Version   // 受影响的依赖方版本
 	Path    []Version // 依赖路径：依赖方 → … → 目标版本
-	Blocked bool      // 在当前快照下该依赖方是否处于被排除状态（可能经由其它隔离路径）
+	Blocked bool      // 在当前快照下该依赖方是否处于被排除状态
 }
 
 // ImpactReport 是影响查询结果。
 type ImpactReport struct {
 	Rev                 int
 	Target              Version
-	DirectlyQuarantined bool          // 目标版本当前是否被直接隔离
-	QuarantineEventSeq  int           // 生效隔离事件序号；未隔离为 0
+	DirectlyQuarantined bool // 目标版本当前是否存在任意原因的生效隔离（含已被豁免覆盖的）
+	QuarantineEventSeq  int  // 最早一条生效隔离的事件序号；无隔离为 0
+	Quarantines         []QuarantineStatus
 	Affected            []ImpactEntry // 所有（传递）依赖到目标版本的版本，按 key 排序
 }
 
@@ -440,9 +849,27 @@ func (snap *Snapshot) Impact(name, version string) (*ImpactReport, error) {
 	tainted := snap.taintMap()
 
 	report := &ImpactReport{Rev: snap.rev, Target: target.Version}
-	if ev, ok := snap.active[k]; ok {
+	if m := snap.active[k]; len(m) > 0 {
 		report.DirectlyQuarantined = true
-		report.QuarantineEventSeq = ev.Seq
+		reasons := make([]string, 0, len(m))
+		for reason := range m {
+			reasons = append(reasons, reason)
+		}
+		sort.Strings(reasons)
+		for _, reason := range reasons {
+			ev := m[reason]
+			if report.QuarantineEventSeq == 0 || ev.Seq < report.QuarantineEventSeq {
+				report.QuarantineEventSeq = ev.Seq
+			}
+			st := QuarantineStatus{Reason: reason, EventSeq: ev.Seq}
+			if w := snap.waived[k][reason]; w != nil {
+				st.Waived = true
+				st.WaiverSeq = w.Seq
+				st.WaiverExpiresAt = w.ExpiresAt
+				st.WaiverApprover = w.Approval.Approver
+			}
+			report.Quarantines = append(report.Quarantines, st)
+		}
 	}
 
 	// 沿反向边 DFS，currentPath 为 [依赖方 ... 起点目标]。
@@ -497,43 +924,77 @@ func (snap *Snapshot) AuditEvents() []*SecurityEvent {
 	return out
 }
 
-// taintMap 计算污染分析：对每个版本，若它本身被直接隔离、或沿依赖边可达
-// 任一被直接隔离版本，则记录从该版本到某个被隔离版本的键路径（含自身之后
-// 的节点，不含自身）。返回 nil 表示该版本未被污染。
+// ActiveWaivers 返回该快照采样时刻有效的豁免（防御性拷贝，按 target、reason 排序）。
+func (snap *Snapshot) ActiveWaivers() []RiskWaiver {
+	var out []RiskWaiver
+	for _, m := range snap.waived {
+		for _, w := range m {
+			out = append(out, *w)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Target.key() != out[j].Target.key() {
+			return out[i].Target.key() < out[j].Target.key()
+		}
+		return out[i].Reason < out[j].Reason
+	})
+	return out
+}
+
+// taintMap 计算污染分析：对每个版本，若它本身存在未被豁免覆盖的隔离原因、
+// 或沿依赖边可达这样的版本，则记录从该版本到某个阻塞版本的键路径与阻塞原因。
+// 返回 nil 表示该版本在当前快照下未被污染。
 // 图是发布时保证的 DAG，故 memo DFS 必然终止；多条路径时取依赖声明顺序
-// 最先发现的一条，保证结果稳定可解释。
-func (snap *Snapshot) taintMap() map[string][]string {
+// 最先发现的一条，自身多原因时按原因字典序取第一条，保证结果稳定可解释。
+func (snap *Snapshot) taintMap() map[string]*taintHit {
 	type state int
 	const (
 		visiting state = iota
 		done
 	)
 	color := map[string]state{}
-	memo := map[string][]string{} // nil = 未污染
+	memo := map[string]*taintHit{} // nil = 未污染
 
-	var visit func(k string) []string
-	visit = func(k string) []string {
+	var visit func(k string) *taintHit
+	visit = func(k string) *taintHit {
 		if color[k] == done {
 			return memo[k]
 		}
 		color[k] = visiting
-		var suffix []string
-		if _, direct := snap.active[k]; direct {
-			suffix = []string{} // 终点：自身之后无节点
-		} else {
+		var hit *taintHit
+
+		// 1) 自身：未被有效豁免覆盖的隔离原因构成阻塞。
+		if qs := snap.active[k]; len(qs) > 0 {
+			open := make([]string, 0, len(qs))
+			for reason := range qs {
+				if snap.waived[k][reason] == nil {
+					open = append(open, reason)
+				}
+			}
+			sort.Strings(open)
+			if len(open) > 0 {
+				hit = &taintHit{path: []string{}, reason: open[0]}
+			}
+		}
+
+		// 2) 依赖：声明顺序优先，取第一个仍被阻塞的下游。
+		if hit == nil {
 			pv := snap.versions[k]
 			for _, d := range pv.Deps {
 				dk := d.key()
 				child := visit(dk)
 				if child != nil {
-					suffix = append([]string{dk}, child...)
+					hit = &taintHit{
+						path:   append([]string{dk}, child.path...),
+						reason: child.reason,
+					}
 					break
 				}
 			}
 		}
 		color[k] = done
-		memo[k] = suffix
-		return suffix
+		memo[k] = hit
+		return hit
 	}
 	for k := range snap.versions {
 		visit(k)
@@ -567,17 +1028,27 @@ func (s *Service) lookupVersion(target Version) (*pkgVersion, error) {
 	return pv, nil
 }
 
-func (s *Service) newEvent(kind string, target Version, reqID, reason string, related int) *SecurityEvent {
+// allocSeq 分配下一个全局事件序号（调用方须持锁）。
+func (s *Service) allocSeq() int {
 	s.nextSeq++
+	return s.nextSeq
+}
+
+func (s *Service) newEvent(kind string, target Version, reqID, reason string, related int) *SecurityEvent {
+	return s.eventAt(s.allocSeq(), kind, target, reqID, reason, related, s.now())
+}
+
+// eventAt 用给定序号与时间构造事件，Rev 按“应用序号 = 当前修订 +1”计算。
+func (s *Service) eventAt(seq int, kind string, target Version, reqID, reason string, related int, now time.Time) *SecurityEvent {
 	return &SecurityEvent{
-		Seq:        s.nextSeq,
+		Seq:        seq,
 		Rev:        s.securityRev + 1,
 		Kind:       kind,
 		Target:     target,
 		ReqID:      reqID,
 		Reason:     reason,
 		RelatedSeq: related,
-		Time:       time.Now().UTC(),
+		Time:       now,
 	}
 }
 
@@ -616,6 +1087,32 @@ func (s *Service) persistSecurity(ev *SecurityEvent, rec *requestRecord) error {
 		return nil
 	}
 	if err := s.store.appendAudit(ev); err != nil {
+		return err
+	}
+	return s.store.appendRequests(rec)
+}
+
+func (s *Service) persistWaiverGrant(ev *SecurityEvent, rec *requestRecord, w *RiskWaiver) error {
+	if s.store == nil {
+		return nil
+	}
+	if err := s.store.appendAudit(ev); err != nil {
+		return err
+	}
+	if err := s.store.appendWaiver(w); err != nil {
+		return err
+	}
+	return s.store.appendRequests(rec)
+}
+
+func (s *Service) persistWaiverRevoke(ev *SecurityEvent, rec *requestRecord, w *RiskWaiver) error {
+	if s.store == nil {
+		return nil
+	}
+	if err := s.store.appendAudit(ev); err != nil {
+		return err
+	}
+	if err := s.store.appendWaiver(w); err != nil {
 		return err
 	}
 	return s.store.appendRequests(rec)
